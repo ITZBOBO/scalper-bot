@@ -1,0 +1,38 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+*.env
+!.env.example
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime Data & State
+data/
+logs/*.csv
+logs/*.log
+test_logs/
+test_data/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
