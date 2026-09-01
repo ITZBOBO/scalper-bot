@@ -33,6 +33,9 @@ class RiskAssessmentResult:
     risk_amount_currency: float = 0.0
     theoretical_group_risk: float = 0.0      # Combined theoretical SL loss
     group_profit_target: float = 2.00        # Group profit target ($2.00 total)
+    raw_lot_size: float = 0.0                # Unquantized theoretical lot size
+    quantized_lot_size: float = 0.0          # Broker step-quantized lot size
+    loss_per_1_lot: float = 0.0              # Monetary loss for 1.0 standard lot at SL
     rejection_reason: Optional[str] = None
 
 
@@ -203,16 +206,17 @@ class RiskManager:
             req_pos = max(1, self.config.positions_per_group)
             position_lots = [volume_min] * req_pos
             calculated_lot = round(sum(position_lots), precision)
+            raw_lot_size = calculated_lot
             theoretical_group_risk = sum(p * loss_per_1_lot for p in position_lots)
         else:
-            # Exact calculated total lot size to risk target percentage
+            # 1. Exact calculated theoretical safe lot size to risk target budget
             raw_lot_size = risk_amount / loss_per_1_lot
 
-            # Quantize to broker volume step
+            # 2. Quantize DOWN to broker volume step
             steps = math.floor(raw_lot_size / volume_step)
             calculated_lot = round(steps * volume_step, precision)
 
-            # Margin Affordability Guard
+            # 3. Margin Affordability Guard
             free_margin = float(account_summary.get("free_margin", balance))
             try:
                 import MetaTrader5 as mt5_margin
@@ -220,7 +224,7 @@ class RiskManager:
                 if req_margin is not None and req_margin > (free_margin * 0.90) and req_margin > 0:
                     margin_per_lot = req_margin / calculated_lot
                     max_affordable_lots = math.floor((free_margin * 0.80 / margin_per_lot) / volume_step) * volume_step
-                    new_lot = max(volume_min, round(max_affordable_lots, precision))
+                    new_lot = max(0.0, round(max_affordable_lots, precision))
                     logger.warning(
                         f"Calculated lot {calculated_lot} required ${req_margin:.2f} margin (Free Margin: ${free_margin:.2f}). "
                         f"Scaled down to {new_lot} lots for safety."
@@ -229,28 +233,31 @@ class RiskManager:
             except Exception:
                 pass
 
-            # Clamp between broker min and max lot size
+            # 4. Strict Risk Invariant Guard: If quantized lot is below broker minimum,
+            # executing volume_min would cause SL loss to exceed the configured risk budget.
+            # Reject immediately (NO TRADE) rather than increasing volume.
             if calculated_lot < volume_min:
                 min_lot_risk = volume_min * loss_per_1_lot
-                max_tolerable_risk = max(risk_amount * 3.5, 5.0) if self.config.fixed_risk_amount else risk_amount * 1.5
-                if min_lot_risk <= max_tolerable_risk:
-                    logger.info(
-                        f"Calculated lot {calculated_lot} below volume_min {volume_min}; clamping to volume_min {volume_min} (Risk: ${min_lot_risk:.2f})"
-                    )
-                    calculated_lot = volume_min
-                else:
-                    reason = (
-                        f"Calculated lot {raw_lot_size:.3f} below broker min {volume_min}. "
-                        f"Required risk ${min_lot_risk:.2f} exceeds target ${risk_amount:.2f}"
-                    )
-                    logger.warning(f"Risk Manager REJECT: {reason}")
-                    return RiskAssessmentResult(approved=False, rejection_reason=reason)
+                reason = (
+                    f"Theoretical safe volume {raw_lot_size:.5f} (quantized {calculated_lot}) is below broker minimum {volume_min}. "
+                    f"Broker minimum lot SL risk (~${min_lot_risk:.2f}) exceeds maximum allowed group risk budget (${risk_amount:.2f}). "
+                    f"Hard risk invariant enforced: NO TRADE."
+                )
+                logger.warning(f"Risk Manager REJECT: {reason}")
+                return RiskAssessmentResult(
+                    approved=False,
+                    raw_lot_size=raw_lot_size,
+                    quantized_lot_size=calculated_lot,
+                    loss_per_1_lot=loss_per_1_lot,
+                    risk_amount_currency=risk_amount,
+                    rejection_reason=reason,
+                )
 
             if calculated_lot > volume_max:
-                logger.warning(f"Calculated lot {calculated_lot} exceeded volume_max {volume_max}; clamping.")
+                logger.warning(f"Calculated lot {calculated_lot} exceeded volume_max {volume_max}; clamping to volume_max {volume_max}.")
                 calculated_lot = volume_max
 
-            # 7. Multi-Position Volume Split (Invariant: Sum(positions) == Total Lot)
+            # 5. Multi-Position Volume Split (Invariant: Sum(positions) == Total Lot)
             position_lots = self.split_group_volume(
                 total_lot=calculated_lot,
                 requested_positions=self.config.positions_per_group,
@@ -260,7 +267,24 @@ class RiskManager:
             )
             theoretical_group_risk = sum(p * loss_per_1_lot for p in position_lots)
 
-        # 8. Group-Level TP Price Calculation ($2.00 Total Profit Across All Positions)
+            # 6. Final Pre-Order Worst-Case Group Risk Validation
+            if theoretical_group_risk > (risk_amount + 1e-4):
+                reason = (
+                    f"Calculated group SL risk (~${theoretical_group_risk:.2f}) exceeds maximum allowed group risk budget (${risk_amount:.2f}). "
+                    f"Hard risk invariant enforced: NO TRADE."
+                )
+                logger.warning(f"Risk Manager REJECT: {reason}")
+                return RiskAssessmentResult(
+                    approved=False,
+                    raw_lot_size=raw_lot_size,
+                    quantized_lot_size=calculated_lot,
+                    loss_per_1_lot=loss_per_1_lot,
+                    risk_amount_currency=risk_amount,
+                    theoretical_group_risk=theoretical_group_risk,
+                    rejection_reason=reason,
+                )
+
+        # 7. Group-Level TP Price Calculation ($2.00 Total Profit Across All Positions)
         group_target = float(self.config.group_profit_target) if self.config.group_profit_target is not None and self.config.group_profit_target > 0 else 0.0
         tick_val = float(getattr(symbol_info, "trade_tick_value", 0.0)) if symbol_info else 0.0
         tick_sz = float(getattr(symbol_info, "trade_tick_size", 0.0)) if symbol_info else 0.0
@@ -306,7 +330,7 @@ class RiskManager:
             f"Entry: {entry_price:.{digits}f} | SL: {sl_price:.{digits}f} ({sl_distance_price:.2f}$) | "
             f"TP: {tp_price:.{digits}f} ({tp_distance_price:.2f}$) | "
             f"Target Group Profit: ${group_target:.2f} Total | "
-            f"Theoretical Combined SL Risk: ~${theoretical_group_risk:.2f}"
+            f"Theoretical Combined SL Risk: ~${theoretical_group_risk:.2f} <= Budget ${risk_amount:.2f}"
         )
 
         return RiskAssessmentResult(
@@ -323,5 +347,8 @@ class RiskManager:
             risk_amount_currency=risk_amount,
             theoretical_group_risk=theoretical_group_risk,
             group_profit_target=group_target,
+            raw_lot_size=raw_lot_size,
+            quantized_lot_size=calculated_lot,
+            loss_per_1_lot=loss_per_1_lot,
             rejection_reason=None,
         )

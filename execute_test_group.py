@@ -88,10 +88,15 @@ def main():
         open_groups_count=0,
     )
 
+    print(f" • Theoretical Volume (Raw)    : {risk_res.raw_lot_size:.5f} lots")
+    print(f" • Broker-Quantized Volume     : {risk_res.quantized_lot_size:.2f} lots")
+    print(f" • Maximum Allowed Group Risk  : ${risk_res.risk_amount_currency:.2f}")
+
     if not risk_res.approved:
-        print(f"[-] Risk Manager rejected test signal: {risk_res.rejection_reason}")
+        print(f"\n🛑 DECISION: NO TRADE (REJECTED)")
+        print(f"[-] Rejection Reason: {risk_res.rejection_reason}")
         connector.shutdown()
-        sys.exit(1)
+        sys.exit(0)
 
     print(f" • Approved          : {risk_res.approved}")
     print(f" • Total Lot Size    : {risk_res.total_lot_size} lots")
@@ -100,8 +105,7 @@ def main():
     print(f" • Stop Loss (SL)    : {risk_res.sl_price:.3f}")
     print(f" • Take Profit (TP)  : {risk_res.tp_price:.3f}")
     print(f" • Group Target (TP) : ${risk_res.group_profit_target:.2f} TOTAL")
-    print(f" • Group Risk Budget : ${risk_res.risk_amount_currency:.2f}")
-    print(f" • Theoretical Risk  : ~${risk_res.theoretical_group_risk:.2f}")
+    print(f" • Theoretical Risk  : ~${risk_res.theoretical_group_risk:.2f} <= Budget ${risk_res.risk_amount_currency:.2f}")
 
     # Execute trade group
     print(f"\n[3] Sending Group Orders to MT5 Terminal...")

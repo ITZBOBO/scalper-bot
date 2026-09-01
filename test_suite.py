@@ -924,13 +924,24 @@ class TestGroupedExecution(unittest.TestCase):
     def test_E_broker_constraints_protect_risk_budget(self):
         """
         Test E — Broker constraints:
-        When minimum lot = 0.01, volume step = 0.01, and total calculated volume is 0.01,
-        the bot MUST NOT multiply volume to 0.03. It safely collapses to [0.01] (1 position).
+        1. When minimum lot = 0.01 and total calculated volume is 0.01, split_group_volume
+           safely collapses to [0.01] (1 position) and never multiplies volume to 0.03.
+        2. When theoretical volume is below broker minimum (e.g. $1 budget vs $3 min-lot loss),
+           evaluate_signal strictly REJECTS the signal (NO TRADE) to preserve the $1 invariant.
         """
         lots = self.risk_manager.split_group_volume(0.01, 3, 0.01, 0.01, is_hedging=True)
         self.assertEqual(lots, [0.01])
         self.assertEqual(len(lots), 1)
         self.assertEqual(sum(lots), 0.01)
+
+        # Under $1.00 risk budget with $3.00 SL distance (loss per lot = $300),
+        # raw lot is 0.0033 lots (< min lot 0.01). Must reject with NO TRADE!
+        tick = {"bid": 2500.00, "ask": 2500.20, "spread_price": 0.20, "spread_points": 20.0}
+        account = {"balance": 1000.0, "is_hedging": True}
+        signal = SimpleNamespace(signal_type=SignalType.BUY, is_valid=True, is_buy=True, is_sell=False, atr_value=2.0, reason="Test Under Min Lot")
+        res = self.risk_manager.evaluate_signal(signal, tick, account, self.symbol_info, open_groups_count=0)
+        self.assertFalse(res.approved)
+        self.assertIn("Hard risk invariant enforced: NO TRADE", res.rejection_reason)
 
     def test_F_netting_mode_collapses_to_single_position(self):
         """
@@ -943,12 +954,16 @@ class TestGroupedExecution(unittest.TestCase):
         self.assertEqual(len(lots), 1)
 
         # Verify TP distance calculation for 1 position of 0.03 lot targeting $2.00:
-        # TP distance = $2.00 / (0.03 * 100) = $0.667
+        # With $10 risk budget and $300 loss per lot, safe lot = 0.03 lots.
+        cfg = BotConfig(fixed_risk_amount=10.0, group_profit_target=2.00, positions_per_group=3, group_risk_mode="FIXED_TOTAL_RISK")
+        rm = RiskManager(cfg)
         tick = {"bid": 2500.00, "ask": 2500.20, "spread_price": 0.20, "spread_points": 20.0}
         account = {"balance": 1000.0, "is_hedging": False}
         signal = SimpleNamespace(signal_type=SignalType.BUY, is_valid=True, is_buy=True, is_sell=False, atr_value=2.0, reason="Test Netting")
-        res = self.risk_manager.evaluate_signal(signal, tick, account, self.symbol_info, open_groups_count=0)
+        res = rm.evaluate_signal(signal, tick, account, self.symbol_info, open_groups_count=0)
         self.assertTrue(res.approved)
+        self.assertEqual(res.positions_count, 1)
+        self.assertEqual(res.position_lots, [0.03])
         self.assertEqual(res.group_profit_target, 2.00)
 
     def test_G_backward_compatibility_single_position(self):
