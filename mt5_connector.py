@@ -52,17 +52,21 @@ class MT5Connector:
         """
         logger.info("Initializing MetaTrader 5 interface...")
 
-        init_kwargs: Dict[str, Any] = {}
+        # 1. Connect to MT5 terminal
+        init_kwargs: Dict[str, Any] = {"timeout": 10000}
         if self.config.mt5_path:
             init_kwargs["path"] = self.config.mt5_path
 
-        # If credentials provided, include in initialization or login explicitly
-        if self.config.mt5_login > 0 and self.config.mt5_password:
-            init_kwargs["login"] = self.config.mt5_login
-            init_kwargs["password"] = self.config.mt5_password
-            init_kwargs["server"] = self.config.mt5_server
+        initialized = mt5.initialize(**init_kwargs)
+        if not initialized and (self.config.mt5_login > 0 and self.config.mt5_password):
+            # Fallback with credentials in initialize call
+            init_with_creds = dict(init_kwargs)
+            init_with_creds["login"] = self.config.mt5_login
+            init_with_creds["password"] = self.config.mt5_password
+            init_with_creds["server"] = self.config.mt5_server
+            initialized = mt5.initialize(**init_with_creds)
 
-        if not mt5.initialize(**init_kwargs):
+        if not initialized:
             err_code, err_msg = mt5.last_error()
             logger.error(f"MT5 initialization failed: [{err_code}] {err_msg}")
             self.is_connected = False
@@ -75,18 +79,21 @@ class MT5Connector:
             self.is_connected = False
             return False
 
-        # If not logged in during init, attempt explicit login
-        if self.config.mt5_login > 0 and self.config.mt5_password:
-            logged_in = mt5.login(
-                login=self.config.mt5_login,
-                password=self.config.mt5_password,
-                server=self.config.mt5_server,
-            )
-            if not logged_in:
-                err_code, err_msg = mt5.last_error()
-                logger.error(f"MT5 login failed for account {self.config.mt5_login}: [{err_code}] {err_msg}")
-                self.is_connected = False
-                return False
+        # 2. Check current account or perform explicit login if needed
+        current_acc = mt5.account_info()
+        if current_acc is None or (self.config.mt5_login > 0 and current_acc.login != self.config.mt5_login):
+            if self.config.mt5_login > 0 and self.config.mt5_password:
+                logged_in = mt5.login(
+                    login=self.config.mt5_login,
+                    password=self.config.mt5_password,
+                    server=self.config.mt5_server,
+                    timeout=10000,
+                )
+                if not logged_in:
+                    err_code, err_msg = mt5.last_error()
+                    logger.error(f"MT5 login failed for account {self.config.mt5_login}: [{err_code}] {err_msg}")
+                    self.is_connected = False
+                    return False
 
         # Retrieve and validate account info
         acc_info = mt5.account_info()
@@ -100,11 +107,15 @@ class MT5Connector:
         trade_mode_str = "DEMO" if acc_info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO else (
             "CONTEST" if acc_info.trade_mode == mt5.ACCOUNT_TRADE_MODE_CONTEST else "REAL"
         )
+        margin_mode_val = getattr(acc_info, "margin_mode", 2)
+        hedging_const = getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
+        is_hedging = (margin_mode_val == hedging_const)
+        margin_mode_str = "HEDGING" if is_hedging else "NETTING"
 
         logger.info(
             f"Connected to Account: {acc_info.login} | Server: {acc_info.server} | "
-            f"Trade Mode: {trade_mode_str} | Balance: {acc_info.balance} {acc_info.currency} | "
-            f"Leverage: 1:{acc_info.leverage}"
+            f"Trade Mode: {trade_mode_str} | Margin Mode: {margin_mode_str} | "
+            f"Balance: {acc_info.balance} {acc_info.currency} | Leverage: 1:{acc_info.leverage}"
         )
 
         # DEMO SAFETY GUARD
@@ -244,6 +255,11 @@ class MT5Connector:
             return None
 
         self.account_info = acc
+        margin_mode_val = getattr(acc, "margin_mode", 2)
+        hedging_const = getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
+        is_hedging = (margin_mode_val == hedging_const)
+        margin_mode_str = "HEDGING" if is_hedging else "NETTING"
+
         return {
             "login": acc.login,
             "balance": acc.balance,
@@ -253,6 +269,10 @@ class MT5Connector:
             "profit": acc.profit,
             "currency": acc.currency,
             "trade_mode": acc.trade_mode,
+            "margin_mode": margin_mode_val,
+            "margin_mode_str": margin_mode_str,
+            "is_hedging": is_hedging,
+            "server": getattr(acc, "server", self.config.mt5_server),
         }
 
     def ensure_connection(self) -> bool:

@@ -50,11 +50,16 @@ def run_verification():
 
     acc = connector.get_account_summary()
     trade_mode = "DEMO" if acc["trade_mode"] == 0 else ("CONTEST" if acc["trade_mode"] == 1 else "REAL/LIVE")
+    margin_str = acc.get("margin_mode_str", "HEDGING")
+    is_hedging = acc.get("is_hedging", True)
     print(f"{Fore.GREEN}✅ MT5 Connected Successfully!{Style.RESET_ALL}")
-    print(f"   • Account Login : {acc['login']}")
-    print(f"   • Trade Mode    : {trade_mode} ({'SAFE' if trade_mode != 'REAL/LIVE' else 'LIVE'})")
-    print(f"   • Server        : {acc.get('server', config.mt5_server)}")
-    print(f"   • Balance       : ${acc['balance']:,.2f} {acc['currency']}")
+    print(f"   • Account Login       : {acc['login']}")
+    print(f"   • Trade Mode          : {trade_mode} ({'SAFE' if trade_mode != 'REAL/LIVE' else 'LIVE'})")
+    print(f"   • Margin Mode         : {Fore.CYAN}{margin_str}{Style.RESET_ALL} ({'Independent multi-position groups supported' if is_hedging else 'Netting mode: orders merge into 1 position'})")
+    print(f"   • Server              : {acc.get('server', config.mt5_server)}")
+    print(f"   • Balance             : ${acc['balance']:,.2f} {acc['currency']}")
+    print(f"   • Group Configuration : {config.positions_per_group} pos/group | Max Groups: {config.max_concurrent_trade_groups} | Mode: {config.group_risk_mode}")
+    print(f"   • Total Risk Budget   : ${config.fixed_risk_amount or 1.0:.2f}")
 
     # -------------------------------------------------------------------------
     # CHECK 2: Symbol Specs & Spread Point Resolution
@@ -71,6 +76,7 @@ def run_verification():
     print(f"{Fore.GREEN}✅ Symbol Resolved: '{sym}'{Style.RESET_ALL}")
     print(f"   • Broker Digits       : {digits}")
     print(f"   • Point Size          : {point}")
+    print(f"   • Contract Size       : {getattr(info, 'trade_contract_size', 100.0)}")
     print(f"   • Tick Value          : {info.trade_tick_value} / Tick Size: {info.trade_tick_size}")
     print(f"   • Min Lot / Step      : {info.volume_min} / {info.volume_step}")
     print(f"   • Max Allowed Spread  : ${config.max_spread_price:.2f} ➔ {Fore.CYAN}{Style.BRIGHT}{spread_pts} broker points{Style.RESET_ALL}")

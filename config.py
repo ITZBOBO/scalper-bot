@@ -70,14 +70,17 @@ class BotConfig:
     # -------------------------------------------------------------------------
     # Strategy & Indicator Parameters
     # -------------------------------------------------------------------------
-    ema_fast_period: int = 9
-    ema_slow_period: int = 21
-    rsi_period: int = 14
-    rsi_overbought: float = 70.0  # Buy filter: only enter BUY if RSI < 70
-    rsi_oversold: float = 30.0    # Sell filter: only enter SELL if RSI > 30
-    atr_period: int = 14
-    sl_atr_multiplier: float = 1.5   # Stop Loss = 1.5 * ATR
-    tp_atr_multiplier: float = 2.0   # Take Profit = 2.0 * ATR
+    ema_fast_period: int = field(default_factory=lambda: _get_int_env("EMA_FAST_PERIOD", 9))
+    ema_slow_period: int = field(default_factory=lambda: _get_int_env("EMA_SLOW_PERIOD", 21))
+    rsi_period: int = field(default_factory=lambda: _get_int_env("RSI_PERIOD", 14))
+    rsi_overbought: float = field(default_factory=lambda: _get_float_env("RSI_OVERBOUGHT", 70.0))
+    rsi_oversold: float = field(default_factory=lambda: _get_float_env("RSI_OVERSOLD", 30.0))
+    atr_period: int = field(default_factory=lambda: _get_int_env("ATR_PERIOD", 14))
+    sl_atr_multiplier: float = field(default_factory=lambda: _get_float_env("SL_ATR_MULTIPLIER", 1.5))
+    tp_atr_multiplier: float = field(default_factory=lambda: _get_float_env("TP_ATR_MULTIPLIER", 1.0))
+    fixed_tp_price_distance: Optional[float] = field(
+        default_factory=lambda: _get_float_env("FIXED_TP_PRICE_DISTANCE", 0.0) if _get_float_env("FIXED_TP_PRICE_DISTANCE", 0.0) > 0 else None
+    )
 
     # -------------------------------------------------------------------------
     # Risk Management & Spread Filter
@@ -93,6 +96,9 @@ class BotConfig:
     max_daily_loss_pct: float = field(default_factory=lambda: _get_float_env("MAX_DAILY_LOSS_PCT", 3.0))
     max_consecutive_losses: int = field(default_factory=lambda: _get_int_env("MAX_CONSECUTIVE_LOSSES", 3))
     max_concurrent_trades: int = field(default_factory=lambda: _get_int_env("MAX_CONCURRENT_TRADES", 1))
+    max_concurrent_trade_groups: int = field(default_factory=lambda: _get_int_env("MAX_CONCURRENT_TRADE_GROUPS", 1))
+    positions_per_group: int = field(default_factory=lambda: _get_int_env("POSITIONS_PER_GROUP", 3))
+    group_risk_mode: str = field(default_factory=lambda: os.getenv("GROUP_RISK_MODE", "FIXED_TOTAL_RISK").strip())
     slippage_points: int = field(default_factory=lambda: _get_int_env("SLIPPAGE_POINTS", 20))
 
     # -------------------------------------------------------------------------

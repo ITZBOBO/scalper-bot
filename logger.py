@@ -24,7 +24,7 @@ import requests
 from config import BotConfig, config as default_config
 from signal_engine import Signal
 from risk_manager import RiskAssessmentResult
-from executor import ExecutionResult, ClosedPositionInfo
+from executor import ExecutionResult, ClosedPositionInfo, TradeGroup, ClosedGroupInfo, GroupExecutionResult
 
 # Initialize colorama
 colorama.init(autoreset=True)
@@ -180,6 +180,33 @@ class TradeLogger:
         except Exception as e:
             self.logger.error(f"Failed to write to trades.csv: {e}")
 
+    def log_closed_group(self, closed_group: ClosedGroupInfo) -> None:
+        """Appends an aggregated completed trade group record to trades.csv."""
+        try:
+            with open(self.trades_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                tickets_str = ";".join(str(t) for t in closed_group.tickets)
+                writer.writerow([
+                    closed_group.group_id,
+                    tickets_str,
+                    closed_group.symbol,
+                    closed_group.order_type,
+                    f"{closed_group.total_volume:.2f}",
+                    closed_group.open_time.isoformat(),
+                    closed_group.close_time.isoformat(),
+                    f"{closed_group.avg_open_price:.3f}",
+                    "",  # SL price
+                    "",  # TP price
+                    f"{closed_group.avg_close_price:.3f}",
+                    f"{closed_group.gross_profit:.2f}",
+                    f"{closed_group.commission:.2f}",
+                    f"{closed_group.swap:.2f}",
+                    f"{closed_group.net_pnl:.2f}",
+                    closed_group.exit_reason,
+                ])
+        except Exception as e:
+            self.logger.error(f"Failed to write group to trades.csv: {e}")
+
     def send_telegram_async(self, message: str) -> None:
         """
         Dispatches a Telegram notification in a separate daemon thread
@@ -215,17 +242,55 @@ class TradeLogger:
     # Structured Telegram Event Formatters
     # -------------------------------------------------------------------------
     def notify_bot_started(self, account_summary: Dict[str, Any], symbol: str) -> None:
+        margin_str = account_summary.get("margin_mode_str", "HEDGING")
         msg = (
             f"🚀 *MT5 Gold Scalper Bot Started*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"• *Symbol:* `{symbol}` (M1)\n"
             f"• *Account:* `{account_summary.get('login', 'N/A')}`\n"
+            f"• *Margin Mode:* `{margin_str}`\n"
             f"• *Balance:* `${account_summary.get('balance', 0):,.2f}`\n"
-            f"• *Risk/Trade:* `{self.config.risk_per_trade_pct}%`\n"
+            f"• *Positions/Group:* `{self.config.positions_per_group}`\n"
+            f"• *Risk Mode:* `{self.config.group_risk_mode}`\n"
+            f"• *Risk Target:* `${self.config.fixed_risk_amount or 1.0:.2f}`\n"
             f"• *Max Daily Loss:* `{self.config.max_daily_loss_pct}%`\n"
             f"• *Max Consecutive Losses:* `{self.config.max_consecutive_losses}`\n"
             f"• *Max Spread:* `${self.config.max_spread_price:.2f}`\n"
             f"• *Mode:* `{'LIVE' if self.config.allow_live_trading else 'DEMO SAFE'}`"
+        )
+        self.send_telegram_async(msg)
+
+    def notify_group_opened(self, group: TradeGroup, risk_result: RiskAssessmentResult) -> None:
+        direction_emoji = "🟢 BUY" if group.order_type == "BUY" else "🔴 SELL"
+        positions_str = ", ".join([f"#{t} ({v} lots)" for t, v in group.position_lots.items()])
+        msg = (
+            f"⚡ *TRADE GROUP OPENED* `{group.group_id}`\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Action:* {direction_emoji}\n"
+            f"• *Symbol:* `{group.symbol}`\n"
+            f"• *Total Volume:* `{group.total_volume:.2f} lots` ({len(group.tickets)} positions)\n"
+            f"• *Positions:* `{positions_str}`\n"
+            f"• *Stop Loss:* `{risk_result.sl_price:.3f}`\n"
+            f"• *Take Profit:* `{risk_result.tp_price:.3f}`\n"
+            f"• *Total Group Risk Target:* `${risk_result.risk_amount_currency:.2f}`\n"
+            f"• *Theoretical SL Risk:* `~${risk_result.theoretical_group_risk:.2f}`\n"
+            f"• *Time (UTC):* `{group.created_at.strftime('%H:%M:%S')}`"
+        )
+        self.send_telegram_async(msg)
+
+    def notify_group_closed(self, closed_group: ClosedGroupInfo) -> None:
+        pnl_emoji = "💰" if closed_group.net_pnl >= 0 else "🔻"
+        outcome_str = "PROFIT" if closed_group.net_pnl >= 0 else "LOSS"
+        msg = (
+            f"{pnl_emoji} *TRADE GROUP CLOSED* `{closed_group.group_id}`\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Outcome:* *{outcome_str}*\n"
+            f"• *Symbol:* `{closed_group.symbol}` ({closed_group.order_type})\n"
+            f"• *Positions Closed:* `{closed_group.positions_closed}/{closed_group.total_positions}` ({closed_group.total_volume:.2f} lots)\n"
+            f"• *Entry Avg:* `{closed_group.avg_open_price:.3f}` ➔ *Exit Avg:* `{closed_group.avg_close_price:.3f}`\n"
+            f"• *Net P&L:* *${closed_group.net_pnl:+,.2f}*\n"
+            f"• *Exit Reason:* `{closed_group.exit_reason}`\n"
+            f"• *Close Time:* `{closed_group.close_time.strftime('%Y-%m-%d %H:%M:%S')}`"
         )
         self.send_telegram_async(msg)
 

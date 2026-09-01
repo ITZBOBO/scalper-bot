@@ -62,17 +62,23 @@ class ScalperBot:
         point = float(sym_info.point) if sym_info and sym_info.point > 0 else 0.01
         spread_pts = round(self.config.max_spread_price / point, 1)
         mode_str = "DEMO SAFE" if not self.config.allow_live_trading else "LIVE TRADING"
+        margin_str = account.get("margin_mode_str", "HEDGING") if account else "HEDGING"
+
+        # Recover any active groups on startup
+        self.executor.recover_active_groups(symbol)
 
         # Prominent startup configuration banner
         logger.info("==================================================================")
         logger.info("             MT5 GOLD (XAUUSD) SCALPING BOT INITIALIZED           ")
         logger.info("==================================================================")
-        logger.info(f" Account Login       : {account.get('login', 'N/A')} ({mode_str})")
+        logger.info(f" Account Login       : {account.get('login', 'N/A')} ({mode_str}) | Margin: {margin_str}")
         logger.info(f" Server & Currency   : {account.get('server', 'N/A')} | {account.get('balance', 0):,.2f} {account.get('currency', 'USD')}")
         logger.info(f" Resolved Symbol     : '{symbol}' (Digits: {sym_info.digits}, Point: {sym_info.point})")
         logger.info(f" Spread Threshold    : MAX_SPREAD_PRICE = ${self.config.max_spread_price:.2f} ➔ {spread_pts} broker points")
         logger.info(f" Strategy Settings   : Timeframe {self.config.timeframe_str} | Fast EMA({self.config.ema_fast_period}) | Slow EMA({self.config.ema_slow_period}) | RSI({self.config.rsi_period}) | ATR({self.config.atr_period})")
-        logger.info(f" Risk Rules          : Risk/Trade {self.config.risk_per_trade_pct}% | Max Daily Loss {self.config.max_daily_loss_pct}% | Max Consecutive Losses {self.config.max_consecutive_losses}")
+        logger.info(f" Group Execution     : Positions/Group: {self.config.positions_per_group} | Max Concurrent Groups: {self.config.max_concurrent_trade_groups} | Mode: {self.config.group_risk_mode}")
+        logger.info(f" Risk Rules          : Fixed Risk: ${self.config.fixed_risk_amount or 1.0:.2f} | Max Daily Loss {self.config.max_daily_loss_pct}% | Max Consecutive Losses {self.config.max_consecutive_losses}")
+        logger.info(f" Active Groups Open  : {self.executor.get_active_groups_count(symbol)}")
         logger.info(f" Telegram Alerts     : {'ENABLED' if self.config.is_telegram_enabled else 'DISABLED (No token/chat_id in .env)'}")
         logger.info("==================================================================")
 
@@ -100,31 +106,31 @@ class ScalperBot:
         signal.signal(signal.SIGTERM, handle_exit)
 
     def _run_event_loop(self) -> None:
-        """Core polling loop checking candle closes and managing active positions."""
+        """Core polling loop checking candle closes and managing active trade groups."""
         symbol = self.connector.resolved_symbol
 
         while self.is_running:
             try:
                 # -------------------------------------------------------------
-                # 1. CONTINUOUS LIFECYCLE CHECK: Monitor Open Position Exits
+                # 1. CONTINUOUS LIFECYCLE CHECK: Monitor Open Trade Group Exits
                 # -------------------------------------------------------------
-                closed_events = self.executor.detect_closed_positions(symbol)
-                if closed_events:
+                closed_groups = self.executor.detect_closed_groups(symbol)
+                if closed_groups:
                     server_dt = self.connector.get_server_time()
                     account = self.connector.get_account_summary()
                     curr_balance = account["balance"] if account else self.kill_switch.starting_daily_balance
 
-                    for closed in closed_events:
+                    for closed in closed_groups:
                         # Log to CSV
-                        self.trade_logger.log_closed_trade(closed)
+                        self.trade_logger.log_closed_group(closed)
                         # Notify Telegram
-                        self.trade_logger.notify_trade_closed(closed)
+                        self.trade_logger.notify_group_closed(closed)
 
-                        # Update Kill Switch
+                        # Update Kill Switch (1 group = 1 trade unit)
                         prev_tripped = self.kill_switch.is_tripped
                         self.kill_switch.record_trade_result(closed.net_pnl, server_dt, curr_balance)
 
-                        # If Kill Switch tripped as a result of this close
+                        # If Kill Switch tripped as a result of this group close
                         if not prev_tripped and self.kill_switch.is_tripped:
                             self.trade_logger.notify_kill_switch(
                                 self.kill_switch.trip_reason or "Risk Limit Exceeded",
@@ -162,7 +168,7 @@ class ScalperBot:
         self._shutdown()
 
     def _process_candle_close(self, candle_df, candle_dt: datetime) -> None:
-        """Evaluates signal and executes trade upon candle close."""
+        """Evaluates signal and executes trade group upon candle close."""
         symbol = self.connector.resolved_symbol
 
         # A. Evaluate Technical Signal
@@ -207,17 +213,16 @@ class ScalperBot:
             return
 
         # D. Risk Assessment & Sizing
-        open_positions_count = self.executor.get_open_positions_count(symbol)
+        active_groups_count = self.executor.get_active_groups_count(symbol)
         risk_result = self.risk_manager.evaluate_signal(
             signal=signal,
             tick=tick,
             account_summary=account,
             symbol_info=symbol_info,
-            open_positions_count=open_positions_count,
+            open_groups_count=active_groups_count,
         )
 
         if not risk_result.approved:
-            # Reject trade with explicit reason recorded to CSV
             logger.warning(f"Trade REJECTED by Risk Manager: {risk_result.rejection_reason}")
             self.trade_logger.log_signal(
                 symbol,
@@ -227,26 +232,26 @@ class ScalperBot:
             )
             return
 
-        # E. Order Execution
-        exec_result = self.executor.execute_market_order(
+        # E. Grouped Order Execution
+        group_res = self.executor.execute_trade_group(
             symbol=symbol,
             signal_type=signal.signal_type,
             risk_result=risk_result,
             symbol_info=symbol_info,
         )
 
-        if exec_result.success:
+        if group_res.success and group_res.group:
             # Log Approved Signal
-            self.trade_logger.log_signal(symbol, signal, status="APPROVED", rejection_reason="Executed")
+            self.trade_logger.log_signal(symbol, signal, status="APPROVED", rejection_reason="Executed Group")
             # Dispatch Telegram Notification
-            self.trade_logger.notify_trade_opened(exec_result, risk_result)
+            self.trade_logger.notify_group_opened(group_res.group, risk_result)
         else:
             # Order placement failed at MT5 level
             self.trade_logger.log_signal(
                 symbol,
                 signal,
                 status="REJECTED",
-                rejection_reason=f"Execution Failed: {exec_result.comment}",
+                rejection_reason=f"Execution Failed: {group_res.rejection_reason}",
             )
 
     def _shutdown(self) -> None:

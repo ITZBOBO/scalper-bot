@@ -21,13 +21,16 @@ def main():
 
     acc = connector.get_account_summary()
     mode_str = "DEMO" if acc.get("trade_mode") == 0 else ("CONTEST" if acc.get("trade_mode") == 1 else "LIVE/REAL")
+    margin_str = acc.get("margin_mode_str", "HEDGING")
     print(f"\n[ACCOUNT OVERVIEW]")
     print(f" • Login       : {acc.get('login')} ({mode_str})")
+    print(f" • Margin Mode : {margin_str}")
     print(f" • Server      : {acc.get('server', config.mt5_server)}")
     print(f" • Balance     : ${acc.get('balance', 0):,.2f} {acc.get('currency', 'USD')}")
     print(f" • Equity      : ${acc.get('equity', 0):,.2f}")
     print(f" • Free Margin : ${acc.get('margin_free', 0):,.2f}")
     print(f" • Floating PnL: ${acc.get('profit', 0):+,.2f}")
+    print(f" • Group Config: {config.positions_per_group} positions/group | Max Groups: {config.max_concurrent_trade_groups} | Risk: ${config.fixed_risk_amount or 1.0:.2f}")
 
     symbol = connector.resolved_symbol
     print(f"\n[SYMBOL & SPREAD]")

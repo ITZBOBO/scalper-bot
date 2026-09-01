@@ -25,7 +25,7 @@ from signal_engine import SignalEngine, SignalType
 from risk_manager import RiskManager
 from kill_switch import KillSwitch
 from logger import TradeLogger
-from executor import ClosedPositionInfo
+from executor import ClosedPositionInfo, TradeGroup, ClosedGroupInfo, GroupExecutionResult
 
 
 class TestSignalEngine(unittest.TestCase):
@@ -143,8 +143,11 @@ class TestRiskManager(unittest.TestCase):
         self.config = BotConfig(
             max_spread_price=0.40,
             risk_per_trade_pct=1.0,
+            fixed_risk_amount=None,
             sl_atr_multiplier=1.5,
             tp_atr_multiplier=2.0,
+            group_risk_mode="FIXED_TOTAL_RISK",
+            fixed_tp_price_distance=None,
         )
         self.risk_manager = RiskManager(self.config)
 
@@ -197,7 +200,7 @@ class TestRiskManager(unittest.TestCase):
 
         result = self.risk_manager.evaluate_signal(signal, tick, account, symbol_info, open_positions_count=1)
         self.assertFalse(result.approved)
-        self.assertIn("Max concurrent trades reached", result.rejection_reason)
+        self.assertIn("Max concurrent trade", result.rejection_reason)
 
     def test_dynamic_lot_sizing_2digit_gold(self):
         """
@@ -260,7 +263,7 @@ class TestRiskManager(unittest.TestCase):
 
     def test_fixed_cash_risk_sizing(self):
         """Test fixed cash risk override (e.g. 2000 NGN or $50 USD fixed)."""
-        cfg = BotConfig(fixed_risk_amount=2000.0)
+        cfg = BotConfig(fixed_risk_amount=2000.0, group_risk_mode="FIXED_TOTAL_RISK")
         rm = RiskManager(cfg)
         symbol_info = self._create_mock_symbol_info(digits=2, point=0.01, tick_value=1.0, tick_size=0.01)
         tick = {"bid": 2500.00, "ask": 2500.20, "spread_price": 0.20, "spread_points": 20.0}
@@ -705,6 +708,330 @@ class TestMainLoop(unittest.TestCase):
             self.fail(f"_run_event_loop crashed unexpectedly with exception: {e}")
 
         self.assertGreaterEqual(iterations, 2)
+
+
+class TestGroupedExecution(unittest.TestCase):
+    """
+    Comprehensive tests for Grouped Multi-Position Trade Execution:
+    1. Risk splitting & strict risk invariant (TOTAL RISK <= BUDGET)
+    2. Single strategy signal creates exactly one trade group
+    3. No duplicate groups while an active group exists
+    4. Group TP exit & PnL aggregation
+    5. Group SL exit & PnL aggregation
+    6. Group-level daily loss & consecutive loss accounting (1 group = 1 trade)
+    7. Restart recovery of active groups
+    8. Broker min-lot constraint protection against volume multiplication
+    9. Group atomicity & orphan position prevention
+    10. Netting account mode fallback
+    11. POSITIONS_PER_GROUP=1 backward compatibility
+    """
+
+    def setUp(self):
+        self.config = BotConfig(
+            fixed_risk_amount=1.00,
+            positions_per_group=3,
+            max_concurrent_trade_groups=1,
+            group_risk_mode="FIXED_TOTAL_RISK",
+        )
+        self.risk_manager = RiskManager(self.config)
+        self.executor = TradeExecutor(self.config)
+        self.symbol_info = SimpleNamespace(
+            name="XAUUSD",
+            digits=2,
+            point=0.01,
+            trade_tick_value=1.0,
+            trade_tick_size=0.01,
+            trade_contract_size=100.0,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            trade_stops_level=0,
+            filling_mode=2,
+        )
+
+    def test_1_risk_splitting_invariant(self):
+        """
+        Test 1 — Risk splitting:
+        Total volume is split across 3 positions, sum equals total volume exactly,
+        and theoretical combined SL risk remains bounded by configured risk budget.
+        """
+        # Case A: 0.03 total lot split across 3 positions -> [0.01, 0.01, 0.01]
+        lots_3 = self.risk_manager.split_group_volume(0.03, 3, 0.01, 0.01, is_hedging=True)
+        self.assertEqual(lots_3, [0.01, 0.01, 0.01])
+        self.assertAlmostEqual(sum(lots_3), 0.03, places=5)
+
+        # Case B: 0.05 total lot split across 3 positions -> [0.02, 0.02, 0.01]
+        lots_5 = self.risk_manager.split_group_volume(0.05, 3, 0.01, 0.01, is_hedging=True)
+        self.assertEqual(lots_5, [0.02, 0.02, 0.01])
+        self.assertAlmostEqual(sum(lots_5), 0.05, places=5)
+
+        # Case C: Sizing evaluation through evaluate_signal
+        tick = {"bid": 2500.00, "ask": 2500.20, "spread_price": 0.20, "spread_points": 20.0}
+        account = {"balance": 1000.0, "is_hedging": True}
+        signal = SimpleNamespace(
+            signal_type=SignalType.BUY,
+            is_valid=True,
+            is_buy=True,
+            is_sell=False,
+            atr_value=2.0,
+            reason="Test BUY",
+        )
+        # SL distance = 1.5 * 2.0 = $3.00. For $1.00 risk, raw lot = 1.00 / 300 = 0.0033 lots. Clamps to min lot 0.01.
+        res = self.risk_manager.evaluate_signal(signal, tick, account, self.symbol_info, open_groups_count=0)
+        self.assertTrue(res.approved)
+        self.assertAlmostEqual(sum(res.position_lots), res.total_lot_size, places=5)
+
+    @patch("MetaTrader5.order_send")
+    def test_2_one_signal_creates_single_trade_group(self, mock_order_send):
+        """
+        Test 2 — One signal creates exactly one trade group with 3 sub-position orders.
+        """
+        mock_order_send.side_effect = [
+            SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=1001, deal=2001, volume=0.01, price=2500.20),
+            SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=1002, deal=2002, volume=0.01, price=2500.20),
+            SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=1003, deal=2003, volume=0.01, price=2500.20),
+        ]
+
+        risk_res = RiskAssessmentResult(
+            approved=True,
+            lot_size=0.03,
+            total_lot_size=0.03,
+            position_lots=[0.01, 0.01, 0.01],
+            positions_count=3,
+            entry_price=2500.20,
+            sl_price=2497.20,
+            tp_price=2504.20,
+            stop_distance_price=3.0,
+            tp_distance_price=4.0,
+            risk_amount_currency=1.00,
+            theoretical_group_risk=1.00,
+        )
+
+        group_res = self.executor.execute_trade_group("XAUUSD", SignalType.BUY, risk_res, self.symbol_info)
+        self.assertTrue(group_res.success)
+        self.assertIsNotNone(group_res.group)
+        self.assertEqual(len(group_res.group.tickets), 3)
+        self.assertEqual(group_res.group.tickets, [1001, 1002, 1003])
+        self.assertEqual(self.executor.get_active_groups_count("XAUUSD"), 1)
+        self.assertEqual(mock_order_send.call_count, 3)
+
+    def test_3_no_duplicate_groups_when_group_active(self):
+        """
+        Test 3 — While a group is active, additional signals are rejected.
+        """
+        tick = {"bid": 2500.00, "ask": 2500.20, "spread_price": 0.20, "spread_points": 20.0}
+        account = {"balance": 1000.0, "is_hedging": True}
+        signal = SimpleNamespace(
+            signal_type=SignalType.BUY,
+            is_valid=True,
+            is_buy=True,
+            is_sell=False,
+            atr_value=2.0,
+            reason="Test BUY",
+        )
+
+        # 1 group currently active >= MAX_CONCURRENT_TRADE_GROUPS (1)
+        res = self.risk_manager.evaluate_signal(signal, tick, account, self.symbol_info, open_groups_count=1)
+        self.assertFalse(res.approved)
+        self.assertIn("Max concurrent trade groups reached", res.rejection_reason)
+
+    @patch("MetaTrader5.history_deals_get")
+    @patch("MetaTrader5.positions_get")
+    def test_4_group_tp_exit_and_pnl_aggregation(self, mock_positions_get, mock_history_deals):
+        """
+        Test 4 — Group TP: All 3 sub-positions reach TP, deals are aggregated, and total profit recorded.
+        """
+        gid = "GRP-TEST-TP-001"
+        group = TradeGroup(
+            group_id=gid,
+            symbol="XAUUSD",
+            order_type="BUY",
+            tickets=[101, 102, 103],
+            position_lots={101: 0.01, 102: 0.01, 103: 0.01},
+            entry_prices={101: 2500.0, 102: 2500.0, 103: 2500.0},
+            sl_price=2497.0,
+            tp_price=2505.0,
+        )
+        self.executor.active_groups[gid] = group
+        for t in group.tickets:
+            self.executor.ticket_to_group[t] = gid
+
+        # MT5 positions is now empty (all closed at TP)
+        mock_positions_get.return_value = []
+
+        # Each ticket produced $5.00 profit at TP
+        deal_tp = SimpleNamespace(entry=mt5.DEAL_ENTRY_OUT, price=2505.0, time=1724750300, profit=5.0, commission=-0.1, swap=0.0, reason=mt5.DEAL_REASON_TP)
+        mock_history_deals.return_value = [deal_tp]
+
+        closed_groups = self.executor.detect_closed_groups("XAUUSD")
+        self.assertEqual(len(closed_groups), 1)
+        cg = closed_groups[0]
+        self.assertEqual(cg.group_id, gid)
+        self.assertEqual(cg.positions_closed, 3)
+        self.assertEqual(cg.exit_reason, "TP")
+        self.assertAlmostEqual(cg.gross_profit, 15.0, places=2)
+        self.assertAlmostEqual(cg.commission, -0.3, places=2)
+        self.assertAlmostEqual(cg.net_pnl, 14.7, places=2)
+        self.assertEqual(len(self.executor.active_groups), 0)
+
+    @patch("MetaTrader5.history_deals_get")
+    @patch("MetaTrader5.positions_get")
+    def test_5_group_sl_exit_and_pnl_aggregation(self, mock_positions_get, mock_history_deals):
+        """
+        Test 5 — Group SL: All 3 sub-positions reach SL, deals are aggregated, and total loss recorded.
+        """
+        gid = "GRP-TEST-SL-001"
+        group = TradeGroup(
+            group_id=gid,
+            symbol="XAUUSD",
+            order_type="BUY",
+            tickets=[201, 202, 203],
+            position_lots={201: 0.01, 202: 0.01, 203: 0.01},
+            entry_prices={201: 2500.0, 202: 2500.0, 203: 2500.0},
+            sl_price=2497.0,
+            tp_price=2505.0,
+        )
+        self.executor.active_groups[gid] = group
+        for t in group.tickets:
+            self.executor.ticket_to_group[t] = gid
+
+        mock_positions_get.return_value = []
+
+        # Each ticket lost -$3.00 at SL
+        deal_sl = SimpleNamespace(entry=mt5.DEAL_ENTRY_OUT, price=2497.0, time=1724750300, profit=-3.0, commission=-0.1, swap=0.0, reason=mt5.DEAL_REASON_SL)
+        mock_history_deals.return_value = [deal_sl]
+
+        closed_groups = self.executor.detect_closed_groups("XAUUSD")
+        self.assertEqual(len(closed_groups), 1)
+        cg = closed_groups[0]
+        self.assertEqual(cg.exit_reason, "SL")
+        self.assertAlmostEqual(cg.gross_profit, -9.0, places=2)
+        self.assertAlmostEqual(cg.net_pnl, -9.3, places=2)
+
+    def test_6_group_counts_as_single_trade_for_kill_switch(self):
+        """
+        Test 6 — Daily loss: One losing group of -$1.00 counts as ONE losing trade, not three.
+        """
+        test_dir = Path("test_ks_group_data")
+        test_dir.mkdir(parents=True, exist_ok=True)
+        ks_config = BotConfig(
+            data_dir=test_dir,
+            kill_switch_state_path=test_dir / "ks_test.json",
+            manual_stop_file_path=test_dir / "STOP",
+            max_daily_loss_pct=3.0,
+            max_consecutive_losses=3,
+        )
+        ks = KillSwitch(ks_config)
+        server_dt = datetime(2026, 8, 27, 12, 0, 0, tzinfo=timezone.utc)
+        ks.sync_server_date(server_dt, current_balance=100.0)
+
+        # 1 group closes with -$1.00 total loss across 3 sub-positions
+        ks.record_trade_result(-1.00, server_dt, 99.0)
+
+        # Must record exactly 1 trade and 1 consecutive loss
+        self.assertEqual(ks.daily_trade_count, 1)
+        self.assertEqual(ks.consecutive_losses, 1)
+        self.assertEqual(ks.daily_realized_pnl, -1.00)
+
+        if test_dir.exists():
+            shutil.rmtree(test_dir)
+
+    @patch("MetaTrader5.positions_get")
+    def test_7_restart_recovery_reconstructs_active_groups(self, mock_positions_get):
+        """
+        Test 7 — Restart recovery: Positions existing in MT5 are correctly grouped and tracked on startup.
+        """
+        mock_positions_get.return_value = [
+            SimpleNamespace(ticket=301, symbol="XAUUSD", type=mt5.ORDER_TYPE_BUY, volume=0.01, price_open=2500.0, sl=2497.0, tp=2505.0, magic=self.config.magic_number, comment="G:174711:1/2", time=1724750000),
+            SimpleNamespace(ticket=302, symbol="XAUUSD", type=mt5.ORDER_TYPE_BUY, volume=0.01, price_open=2500.0, sl=2497.0, tp=2505.0, magic=self.config.magic_number, comment="G:174711:2/2", time=1724750000),
+        ]
+
+        self.executor.recover_active_groups("XAUUSD")
+        self.assertEqual(self.executor.get_active_groups_count("XAUUSD"), 1)
+        group = list(self.executor.active_groups.values())[0]
+        self.assertEqual(group.tickets, [301, 302])
+        self.assertAlmostEqual(group.total_volume, 0.02, places=4)
+        self.assertEqual(self.executor.ticket_to_group[301], group.group_id)
+        self.assertEqual(self.executor.ticket_to_group[302], group.group_id)
+
+    def test_8_broker_constraints_protect_risk_budget(self):
+        """
+        Test 8 — Invariant Protection:
+        When minimum lot = 0.01, volume step = 0.01, and total calculated volume is 0.01,
+        the bot MUST NOT multiply volume to 0.03. It safely collapses to [0.01] (1 position).
+        """
+        # Requested 3 positions, but total volume is only 0.01
+        lots = self.risk_manager.split_group_volume(0.01, 3, 0.01, 0.01, is_hedging=True)
+        self.assertEqual(lots, [0.01])
+        self.assertEqual(len(lots), 1)
+        self.assertEqual(sum(lots), 0.01)
+
+        # Requested 3 positions, total volume 0.02 -> splits into 2 positions of 0.01
+        lots_2 = self.risk_manager.split_group_volume(0.02, 3, 0.01, 0.01, is_hedging=True)
+        self.assertEqual(lots_2, [0.01, 0.01])
+        self.assertEqual(len(lots_2), 2)
+        self.assertEqual(sum(lots_2), 0.02)
+
+    @patch("MetaTrader5.order_send")
+    @patch("MetaTrader5.symbol_info_tick")
+    @patch("MetaTrader5.symbol_info")
+    @patch("MetaTrader5.history_deals_get")
+    @patch("MetaTrader5.positions_get")
+    def test_9_group_atomicity_and_orphan_prevention(self, mock_positions_get, mock_history_deals, mock_sym_info, mock_tick, mock_order_send):
+        """
+        Test 9 — Group Atomicity:
+        If 1 position in a group closes prematurely, detect_closed_groups immediately
+        issues market close orders for the remaining positions so no orphans remain.
+        """
+        gid = "GRP-TEST-ORPHAN-001"
+        group = TradeGroup(
+            group_id=gid,
+            symbol="XAUUSD",
+            order_type="BUY",
+            tickets=[401, 402],
+            position_lots={401: 0.01, 402: 0.01},
+            entry_prices={401: 2500.0, 402: 2500.0},
+            sl_price=2497.0,
+            tp_price=2505.0,
+        )
+        self.executor.active_groups[gid] = group
+        self.executor.ticket_to_group[401] = gid
+        self.executor.ticket_to_group[402] = gid
+
+        # 401 closed, but 402 is still open
+        mock_positions_get.side_effect = [
+            [SimpleNamespace(ticket=402, type=mt5.ORDER_TYPE_BUY, volume=0.01, magic=self.config.magic_number)],
+            [SimpleNamespace(ticket=402, type=mt5.ORDER_TYPE_BUY, volume=0.01, magic=self.config.magic_number)],
+            [], # after closing order
+        ]
+        mock_tick.return_value = SimpleNamespace(bid=2499.0, ask=2499.20)
+        mock_sym_info.return_value = self.symbol_info
+        mock_order_send.return_value = SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE)
+
+        mock_deal = SimpleNamespace(entry=mt5.DEAL_ENTRY_OUT, price=2499.0, time=1724750300, profit=-1.0, commission=-0.1, swap=0.0, reason=mt5.DEAL_REASON_SL)
+        mock_history_deals.return_value = [mock_deal]
+
+        closed_groups = self.executor.detect_closed_groups("XAUUSD")
+        self.assertEqual(len(closed_groups), 1)
+        self.assertEqual(mock_order_send.call_count, 1)  # Triggered close on orphan position 402
+
+    def test_10_netting_mode_collapses_to_single_position(self):
+        """
+        Test 10 — Netting Mode Fallback:
+        When account is Netting (is_hedging = False), split_group_volume returns [total_lot].
+        """
+        lots = self.risk_manager.split_group_volume(0.03, 3, 0.01, 0.01, is_hedging=False)
+        self.assertEqual(lots, [0.03])
+        self.assertEqual(len(lots), 1)
+
+    def test_11_positions_per_group_1_backward_compatibility(self):
+        """
+        Test 11 — Backward compatibility:
+        POSITIONS_PER_GROUP = 1 preserves single-position behavior.
+        """
+        lots = self.risk_manager.split_group_volume(0.03, 1, 0.01, 0.01, is_hedging=True)
+        self.assertEqual(lots, [0.03])
+        self.assertEqual(len(lots), 1)
 
 
 if __name__ == "__main__":
