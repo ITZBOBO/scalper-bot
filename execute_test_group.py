@@ -99,7 +99,8 @@ def main():
     print(f" • Entry Price       : {risk_res.entry_price:.3f}")
     print(f" • Stop Loss (SL)    : {risk_res.sl_price:.3f}")
     print(f" • Take Profit (TP)  : {risk_res.tp_price:.3f}")
-    print(f" • Risk Target       : ${risk_res.risk_amount_currency:.2f}")
+    print(f" • Group Target (TP) : ${risk_res.group_profit_target:.2f} TOTAL")
+    print(f" • Group Risk Budget : ${risk_res.risk_amount_currency:.2f}")
     print(f" • Theoretical Risk  : ~${risk_res.theoretical_group_risk:.2f}")
 
     # Execute trade group

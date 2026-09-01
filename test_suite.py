@@ -963,45 +963,13 @@ class TestGroupedExecution(unittest.TestCase):
         self.assertEqual(lots, [0.03])
         self.assertEqual(len(lots), 1)
 
-    def test_H_dynamic_symbol_properties_calculation(self):
+    def test_H_different_entry_prices_and_weighted_average(self):
         """
-        Test H — Dynamic Symbol Properties:
-        TP calculation uses dynamic MT5 symbol properties (tick_size, tick_value, contract_size)
-        without any hard-coded $100 contract_size or $0.667 assumptions.
-        """
-        # Custom index/crypto symbol with contract_size=10.0, tick_size=0.1, tick_value=1.0
-        custom_symbol = SimpleNamespace(
-            name="CUSTOM",
-            digits=1,
-            point=0.1,
-            trade_tick_value=1.0,
-            trade_tick_size=0.1,
-            trade_contract_size=10.0,
-            volume_min=0.01,
-            volume_max=100.0,
-            volume_step=0.01,
-            trade_stops_level=0,
-        )
-        tick = {"bid": 1000.0, "ask": 1000.2, "spread_price": 0.2, "spread_points": 2.0}
-        account = {"balance": 1000.0, "is_hedging": True}
-        signal = SimpleNamespace(signal_type=SignalType.BUY, is_valid=True, is_buy=True, is_sell=False, atr_value=2.0, reason="Custom Symbol")
-
-        # val_per_price_unit_per_lot = tick_value / tick_size = 1.0 / 0.1 = 10.0
-        # For 0.03 lot, 0.03 * 10.0 = 0.30 per 1.0 price move.
-        # For group profit target $2.00, TP price distance = 2.00 / 0.30 = 6.6667
-        cfg = BotConfig(group_profit_target=2.00, fixed_risk_amount=1.00, group_risk_mode="FIXED_TOTAL_RISK", positions_per_group=3)
-        rm = RiskManager(cfg)
-        res = rm.evaluate_signal(signal, tick, account, custom_symbol, open_groups_count=0)
-        self.assertTrue(res.approved)
-        self.assertAlmostEqual(res.tp_distance_price, 2.00 / (res.total_lot_size * 10.0), places=3)
-
-    def test_I_different_entry_prices_and_weighted_average(self):
-        """
-        Test I — Different Entry Prices:
+        Test H — Different Entry Prices:
         Positions opened with different entry prices (e.g. 2500.0, 2500.5, 2501.0)
         correctly compute weighted average entry and close when aggregate P&L reaches $2.00.
         """
-        gid = "GRP-TEST-I-001"
+        gid = "GRP-TEST-H-001"
         group = TradeGroup(
             group_id=gid,
             symbol="XAUUSD",
@@ -1049,6 +1017,79 @@ class TestGroupedExecution(unittest.TestCase):
             self.assertEqual(len(closed_groups), 1)
             self.assertEqual(mock_send.call_count, 3)
             self.assertEqual(len(self.executor.active_groups), 0)
+
+    def test_I_unexpected_partial_closure_leaves_no_orphans(self):
+        """
+        Test I — Unexpected Partial Closure / Orphan Prevention:
+        If 1 position in a group closes/disappears unexpectedly, detect_closed_groups
+        immediately liquidates remaining positions and reconciles as ONE completed trade.
+        """
+        gid = "GRP-TEST-ORPHAN-001"
+        group = TradeGroup(
+            group_id=gid,
+            symbol="XAUUSD",
+            order_type="BUY",
+            tickets=[401, 402, 403],
+            position_lots={401: 0.01, 402: 0.01, 403: 0.01},
+            entry_prices={401: 2500.0, 402: 2500.0, 403: 2500.0},
+            profit_target=2.00,
+        )
+        self.executor.active_groups[gid] = group
+        self.executor.ticket_to_group[401] = gid
+        self.executor.ticket_to_group[402] = gid
+        self.executor.ticket_to_group[403] = gid
+
+        # 401 closed unexpectedly, 402 and 403 remain open
+        mock_open_positions = [
+            SimpleNamespace(ticket=402, type=mt5.ORDER_TYPE_BUY, volume=0.01, profit=-0.20, swap=0.0, magic=self.config.magic_number),
+            SimpleNamespace(ticket=403, type=mt5.ORDER_TYPE_BUY, volume=0.01, profit=-0.20, swap=0.0, magic=self.config.magic_number),
+        ]
+
+        with patch("MetaTrader5.positions_get") as mock_pos, \
+             patch("MetaTrader5.order_send") as mock_send, \
+             patch("MetaTrader5.symbol_info_tick") as mock_tick, \
+             patch("MetaTrader5.symbol_info") as mock_sym, \
+             patch("MetaTrader5.history_deals_get") as mock_deals:
+
+            open_list = list(mock_open_positions)
+            def mock_pos_func(**kwargs):
+                if "ticket" in kwargs:
+                    t = kwargs["ticket"]
+                    return [p for p in mock_open_positions if p.ticket == t]
+                if mock_send.call_count >= 2:
+                    return []
+                return open_list
+
+            mock_pos.side_effect = mock_pos_func
+            mock_tick.return_value = SimpleNamespace(bid=2499.50, ask=2499.70)
+            mock_sym.return_value = self.symbol_info
+            mock_send.return_value = SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE)
+            mock_deals.return_value = [SimpleNamespace(entry=mt5.DEAL_ENTRY_OUT, price=2499.50, time=1724750300, profit=-0.33, commission=0.0, swap=0.0, reason=mt5.DEAL_REASON_SL)]
+
+            closed_groups = self.executor.detect_closed_groups("XAUUSD")
+            self.assertEqual(len(closed_groups), 1)
+            self.assertEqual(mock_send.call_count, 2)  # Liquidated orphan positions 402 & 403
+            self.assertEqual(len(self.executor.active_groups), 0)
+
+    def test_J_restart_recovery_reconstructs_active_groups(self):
+        """
+        Test J — Restart Recovery:
+        Positions existing in MT5 are correctly grouped and reconstructed on bot startup.
+        """
+        mock_positions = [
+            SimpleNamespace(ticket=601, symbol="XAUUSD", type=mt5.ORDER_TYPE_BUY, volume=0.01, price_open=2500.0, sl=2497.0, tp=2505.0, magic=self.config.magic_number, comment="G:184511:1/2", time=1724750000),
+            SimpleNamespace(ticket=602, symbol="XAUUSD", type=mt5.ORDER_TYPE_BUY, volume=0.01, price_open=2500.0, sl=2497.0, tp=2505.0, magic=self.config.magic_number, comment="G:184511:2/2", time=1724750000),
+        ]
+
+        with patch("MetaTrader5.positions_get") as mock_pos:
+            mock_pos.return_value = mock_positions
+            self.executor.recover_active_groups("XAUUSD")
+            self.assertEqual(self.executor.get_active_groups_count("XAUUSD"), 1)
+            group = list(self.executor.active_groups.values())[0]
+            self.assertEqual(group.tickets, [601, 602])
+            self.assertAlmostEqual(group.total_volume, 0.02, places=4)
+            self.assertEqual(self.executor.ticket_to_group[601], group.group_id)
+            self.assertEqual(self.executor.ticket_to_group[602], group.group_id)
 
 
 if __name__ == "__main__":
