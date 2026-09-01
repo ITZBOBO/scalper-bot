@@ -99,6 +99,7 @@ class BotConfig:
     max_concurrent_trade_groups: int = field(default_factory=lambda: _get_int_env("MAX_CONCURRENT_TRADE_GROUPS", 1))
     positions_per_group: int = field(default_factory=lambda: _get_int_env("POSITIONS_PER_GROUP", 3))
     group_risk_mode: str = field(default_factory=lambda: os.getenv("GROUP_RISK_MODE", "FIXED_TOTAL_RISK").strip())
+    group_profit_target: float = field(default_factory=lambda: _get_float_env("GROUP_PROFIT_TARGET", 2.00))
     slippage_points: int = field(default_factory=lambda: _get_int_env("SLIPPAGE_POINTS", 20))
 
     # -------------------------------------------------------------------------

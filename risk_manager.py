@@ -32,6 +32,7 @@ class RiskAssessmentResult:
     tp_distance_price: float = 0.0
     risk_amount_currency: float = 0.0
     theoretical_group_risk: float = 0.0      # Combined theoretical SL loss
+    group_profit_target: float = 2.00        # Group profit target ($2.00 total)
     rejection_reason: Optional[str] = None
 
 
@@ -259,7 +260,23 @@ class RiskManager:
             )
             theoretical_group_risk = sum(p * loss_per_1_lot for p in position_lots)
 
-        # 8. Exact SL and TP Price Calculation
+        # 8. Group-Level TP Price Calculation ($2.00 Total Profit Across All Positions)
+        group_target = float(self.config.group_profit_target) if self.config.group_profit_target is not None and self.config.group_profit_target > 0 else 0.0
+        tick_val = float(getattr(symbol_info, "trade_tick_value", 0.0)) if symbol_info else 0.0
+        tick_sz = float(getattr(symbol_info, "trade_tick_size", 0.0)) if symbol_info else 0.0
+        if tick_val > 0 and tick_sz > 0:
+            profit_per_1_lot_per_price_unit = tick_val / tick_sz
+        else:
+            profit_per_1_lot_per_price_unit = contract_size
+
+        if group_target > 0 and calculated_lot > 0:
+            # Price move required so that sum(position_lots) captures group_target ($2.00)
+            tp_distance_price = group_target / (calculated_lot * profit_per_1_lot_per_price_unit)
+        elif self.config.fixed_tp_price_distance and self.config.fixed_tp_price_distance > 0:
+            tp_distance_price = self.config.fixed_tp_price_distance
+        else:
+            tp_distance_price = atr * self.config.tp_atr_multiplier
+
         stops_level = int(symbol_info.trade_stops_level) if symbol_info else 0
         min_stop_distance_price = stops_level * point
 
@@ -288,7 +305,8 @@ class RiskManager:
             f"Total Lots: {calculated_lot} across {len(position_lots)} position(s) {position_lots} | "
             f"Entry: {entry_price:.{digits}f} | SL: {sl_price:.{digits}f} ({sl_distance_price:.2f}$) | "
             f"TP: {tp_price:.{digits}f} ({tp_distance_price:.2f}$) | "
-            f"Target Risk: ${risk_amount:.2f} | Theoretical Combined SL Risk: ~${theoretical_group_risk:.2f}"
+            f"Target Group Profit: ${group_target:.2f} Total | "
+            f"Theoretical Combined SL Risk: ~${theoretical_group_risk:.2f}"
         )
 
         return RiskAssessmentResult(
@@ -304,5 +322,6 @@ class RiskManager:
             tp_distance_price=tp_distance_price,
             risk_amount_currency=risk_amount,
             theoretical_group_risk=theoretical_group_risk,
+            group_profit_target=group_target,
             rejection_reason=None,
         )

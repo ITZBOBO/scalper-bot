@@ -272,7 +272,8 @@ class TradeLogger:
             f"• *Positions:* `{positions_str}`\n"
             f"• *Stop Loss:* `{risk_result.sl_price:.3f}`\n"
             f"• *Take Profit:* `{risk_result.tp_price:.3f}`\n"
-            f"• *Total Group Risk Target:* `${risk_result.risk_amount_currency:.2f}`\n"
+            f"• *Total Group Profit Target:* `${risk_result.group_profit_target:.2f}`\n"
+            f"• *Total Group Risk Budget:* `${risk_result.risk_amount_currency:.2f}`\n"
             f"• *Theoretical SL Risk:* `~${risk_result.theoretical_group_risk:.2f}`\n"
             f"• *Time (UTC):* `{group.created_at.strftime('%H:%M:%S')}`"
         )

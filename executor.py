@@ -83,7 +83,8 @@ class TradeGroup:
     entry_prices: Dict[int, float] = field(default_factory=dict)      # ticket -> price
     sl_price: float = 0.0
     tp_price: float = 0.0
-    target_risk: float = 0.0
+    target_risk: float = 0.0                   # Intended group loss budget from config
+    profit_target: float = 0.0                 # Intended group profit target from config
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     status: str = "OPEN"                       # "OPEN", "PARTIAL", "CLOSED"
 
@@ -94,6 +95,13 @@ class TradeGroup:
     @property
     def positions_count(self) -> int:
         return len(self.tickets)
+
+    @property
+    def weighted_avg_entry(self) -> float:
+        total_vol = self.total_volume
+        if total_vol <= 0 or not self.entry_prices:
+            return 0.0
+        return sum(self.entry_prices.get(t, 0.0) * self.position_lots.get(t, 0.0) for t in self.tickets) / total_vol
 
 
 @dataclass
@@ -359,6 +367,7 @@ class TradeExecutor:
             sl_price=risk_result.sl_price,
             tp_price=risk_result.tp_price,
             target_risk=risk_result.risk_amount_currency,
+            profit_target=getattr(risk_result, "group_profit_target", 2.00),
         )
 
         exec_results: List[ExecutionResult] = []
@@ -548,11 +557,32 @@ class TradeExecutor:
             open_sub_tickets = [t for t in group.tickets if t in current_open_tickets]
             closed_sub_tickets = [t for t in group.tickets if t not in current_open_tickets]
 
-            # 1. ORPHAN POSITION PREVENTION: Partial group exit detected
+            # 1. REAL-TIME AUTHORITATIVE AGGREGATE GROUP P&L EVALUATION ($2.00 Total Target Across Group)
+            open_pos_map = {pos.ticket: pos for pos in current_open_positions if pos.ticket in open_sub_tickets}
+            if len(open_pos_map) > 0 and getattr(group, "profit_target", 0.0) > 0:
+                group_floating_profit = sum(getattr(pos, 'profit', 0.0) for pos in open_pos_map.values())
+                group_floating_swap = sum(getattr(pos, 'swap', 0.0) for pos in open_pos_map.values())
+                group_floating_commission = sum(getattr(pos, 'commission', 0.0) for pos in open_pos_map.values())
+                group_floating_pnl = group_floating_profit + group_floating_swap + group_floating_commission
+
+                if group_floating_pnl >= group.profit_target:
+                    logger.info(
+                        f"🎯 [AUTHORITATIVE GROUP PROFIT TARGET REACHED] {gid} combined floating PnL ${group_floating_pnl:+.2f} >= target ${group.profit_target:.2f}. "
+                        f"Closing all {len(open_pos_map)} position(s) to secure total group profit!"
+                    )
+                    for t in list(open_pos_map.keys()):
+                        self.close_position_by_ticket(t, symbol)
+                    # Re-query open positions
+                    current_open_positions = self.get_open_positions(symbol)
+                    current_open_tickets = {pos.ticket for pos in current_open_positions}
+                    open_sub_tickets = [t for t in group.tickets if t in current_open_tickets]
+                    closed_sub_tickets = [t for t in group.tickets if t not in current_open_tickets]
+
+            # 2. ORPHAN PREVENTION & UNEXPECTED DISAPPEARANCE RECONCILIATION
             if len(closed_sub_tickets) > 0 and len(open_sub_tickets) > 0:
                 logger.warning(
-                    f"⚠️ [GROUP SYNC] Partial close detected in {gid} ({len(closed_sub_tickets)}/{len(group.tickets)} closed). "
-                    f"Executing market close on remaining {len(open_sub_tickets)} position(s) to maintain group atomicity."
+                    f"⚠️ [GROUP RECONCILIATION / ORPHAN PREVENTION] Position in {gid} closed/disappeared ({len(closed_sub_tickets)}/{len(group.tickets)} closed). "
+                    f"Executing market close on remaining {len(open_sub_tickets)} position(s) immediately to maintain group atomicity."
                 )
                 for t in open_sub_tickets:
                     self.close_position_by_ticket(t, symbol)
@@ -561,7 +591,7 @@ class TradeExecutor:
                 current_open_tickets = {pos.ticket for pos in current_open_positions}
                 open_sub_tickets = [t for t in group.tickets if t in current_open_tickets]
 
-            # 2. COMPLETE GROUP EXIT: All positions closed
+            # 3. COMPLETE GROUP EXIT: All positions closed
             if len(open_sub_tickets) == 0 and len(group.tickets) > 0:
                 self.active_groups.pop(gid, None)
 
